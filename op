@@ -1,0 +1,697 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use v5.28;
+use utf8;
+use open ':std', ':encoding(UTF-8)';
+use Encode qw(decode_utf8 encode_utf8);
+
+use LWP::UserAgent;
+use HTTP::Request;
+use JSON::PP qw(decode_json encode_json);
+
+binmode STDOUT, ':encoding(UTF-8)';
+binmode STDERR, ':encoding(UTF-8)';
+
+# Decode command-line args as UTF-8. Without this, JSON::PP::encode_json
+# treats the raw bytes as Latin-1 and double-encodes non-ASCII text
+# (e.g. an em dash E2 80 94 is sent as C3 A2 C2 80 C2 94).
+@ARGV = map { decode_utf8($_, Encode::FB_CROAK) } @ARGV;
+
+# ── load .env ──────────────────────────────────────────────────────────────
+
+my %EV;
+{
+    if (-e '.env') {
+        open my $fh, '<:encoding(UTF-8)', '.env' or goto SKIP;
+SKIP_LABEL:
+        while (my $line = <$fh>) {
+            $line =~ s/^\s+|\s+$//g;
+            next if $line =~ /^\s*#/;
+            next if $line eq '';
+            if ($line =~ /^(\w+)="?(.+?)"?\s*$/) {
+                $EV{$1} = $2;
+            }
+        }
+SKIP:
+        close $fh;
+    }
+}
+
+my $OP_URL   = $EV{OPENPROJECT_URL}
+              // die "OPENPROJECT_URL missing from .env\n";
+my $OP_TOKEN = $EV{OPENPROJECT_ACCESS_TOKEN}
+              // die "OPENPROJECT_ACCESS_TOKEN missing from .env\n";
+my $OP_USER  = $EV{OPENPROJECT_USERNAME} // '…';
+my $OP_PID   = $EV{OPENPROJECT_PROJECT_ID} // '';
+$OP_URL =~ s|/+$||;
+
+# ── HTTP client ────────────────────────────────────────────────────────────
+
+my $ua = LWP::UserAgent->new(agent => 'op/0.1', timeout => 30);
+
+sub req {
+    my ($m, $ep, $body) = @_;
+    my $r = HTTP::Request->new($m, $OP_URL . $ep);
+    $r->header(Authorization => "Bearer $OP_TOKEN");
+    if ($body && $m =~ /^(POST|PATCH|PUT)$/) {
+        $r->header('Content-Type' => 'application/json');
+        $r->content(encode_json($body));
+    }
+    my $res = $ua->request($r);
+    unless ($res->is_success) {
+        my $e = "HTTP " . $res->code . ": " . $res->message;
+        eval { $e .= ' — ' . (decode_json($res->content)->{message} // ''); };
+        die $e . "\n";
+    }
+    my $c = $res->content;
+    return [] unless $c;
+    return decode_json($c);
+}
+
+# Paginate all results
+sub all_get {
+    my ($base) = @_;
+    my @out;
+    my $off = 1;
+    while (1) {
+        my $sep = index($base, '?') >= 0 ? '&' : '?';
+        my $d = req('GET', $base . $sep . 'pageSize=100&offset=' . $off);
+        my $e = $d->{_embedded}{elements} // [];
+        push @out, @$e;
+        last if @$e < 100;
+        $off += 100;
+    }
+    return \@out;
+}
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+# Resolve name or numeric ID
+sub rid {
+    my ($nm, $url) = @_;
+    return undef unless defined $nm && $nm ne '';
+    return int($nm) if $nm =~ /^\d+$/;
+    for my $item (@{all_get($url)}) {
+        if (lc($item->{name}) eq lc($nm)) {
+            return $item->{id};
+        }
+    }
+    return undef;
+}
+
+sub kv {
+    my %o;
+    for my $s (@_) {
+        if ($s =~ /^([^=]+)=(.*)$/s) {   # /s: values may be multi-line (descriptions)
+            $o{$1} = $2;
+        }
+    }
+    return \%o;
+}
+
+# ── output printers ───────────────────────────────────────────────────────
+
+sub table_projects {
+    my $ps = shift;
+    my $n = scalar @$ps;
+    if ($n == 0) {
+        say "\nNo projects.\n";
+        return;
+    }
+    printf "\n%-5s %-22s %-40s %s\n\n", 'ID', 'Identifier', 'Name', 'Public';
+    print '-' x 74, "\n";
+    for my $p (@$ps) {
+        my $nm = $p->{name} // '';
+        $nm = substr($nm, 0, 37) . '…' if length($nm) > 38;
+        my $pub = $p->{public} ? 'yes' : 'no';
+        printf "%-5s %-22s %-40s %s\n", $p->{id} // '.', $p->{identifier} // '', $nm, $pub;
+    }
+    printf "\n(%d projects)\n\n", $n;
+}
+
+sub table_wps {
+    my $ws = shift;
+    my $n = scalar @$ws;
+    if ($n == 0) {
+        say "\nNo work packages found.\n";
+        return;
+    }
+    printf "\n%-6s %-13s %-20s %-11s %-30s  ┃ %-12s / %-20s\n\n",
+           'ID', 'Type', 'Status', 'Priority', 'Subject', 'Author', 'Project';
+    print '-' x 110, "\n";
+    for my $w (@$ws) {
+        my $sl  = $w->{_links} // {};
+        my $sub = $w->{subject} // '(empty)';
+        $sub = substr($sub, 0, 28) . '…' if length($sub) > 30;
+        my $type     = $sl->{type}{title}     // '.';
+        my $status   = $sl->{status}{title}   // '.';
+        my $priority = $sl->{priority}{title} // '.';
+        my $author   = $sl->{author}{title}   // '.';
+        my $project  = $sl->{project}{title}  // '.';
+        printf "%-6s %-13s %-20s %-11s %-30s  ┃ %-12s / %-20s\n",
+            $w->{id}, $type, $status, $priority, $sub, $author, $project;
+    }
+    printf "\n(%d tickets)\n\n", $n;
+}
+
+sub table_enum {
+    my ($label, $items) = @_;
+    my $n = scalar @$items;
+    say "\n$label";
+    print '-' x 42, "\n";
+    for my $i (@$items) {
+        my $m = '';
+        $m .= ' (default)'  if $i->{isDefault};
+        $m .= ' (closed)'   if defined $i->{isClosed} && $i->{isClosed};
+        printf "  %-4s %-25s %s\n", $i->{id}, $i->{name}, $m;
+    }
+    printf "\n(%d)\n\n", $n;
+}
+
+sub json_out { say encode_json(shift); }
+
+sub uri_esc {
+    my $s = shift;
+    # If it is a character string (UTF-8 flagged), re-encode to bytes first
+    # so the %XX escapes match what goes on the wire.
+    $s = encode_utf8($s) if utf8::is_utf8($s);
+    $s =~ s/([^A-Za-z0-9_.\-~])/sprintf("%%%02X", ord($1))/ge;
+    return $s;
+}
+
+# ── project commands ───────────────────────────────────────────────────────
+
+sub prj_list {
+    table_projects(all_get('/api/v3/projects'));
+}
+
+sub prj_get {
+    my $id = shift;
+    die "Usage: project get <id|identifier>\n" unless defined $id && $id ne '';
+    json_out(req('GET', '/api/v3/projects/' . $id));
+}
+
+sub prj_create {
+    my $name     = shift;
+    my $slug_raw = shift;
+    $slug_raw //= $name;
+    my $slug = lc($slug_raw);
+    $slug =~ s/[^a-z0-9]+/-/g;
+    $slug =~ s/^-+|-+$//g;
+    my $body = {
+        name         => $name,
+        identifier   => $slug,
+        description  => { format => 'markdown', raw => $name },
+        public       => \1,
+    };
+    my $r = req('POST', '/api/v3/projects', $body);
+    say "Created project: " . $r->{name} . "  (id=" . $r->{id} . ", identifier=" . $r->{identifier} . ")";
+}
+
+sub prj_update {
+    my $id   = shift;
+    my $kv   = shift;
+    my %b;
+    $b{name}       = $kv->{name}       if $kv->{name};
+    $b{identifier} = $kv->{identifier} if $kv->{identifier};
+    if ($kv->{description}) {
+        $b{description} = { format => 'markdown', raw => $kv->{description} };
+    }
+    $b{active} = ($kv->{active} eq 'true' ? \1 : \0) if $kv->{active};
+    $b{public} = ($kv->{public} eq 'true' ? \1 : \0) if $kv->{public};
+    my $r = req('PATCH', '/api/v3/projects/' . $id, {%b});
+    say "Updated project: " . $r->{name} . "  (id=" . $r->{id} . ")";
+}
+
+sub prj_delete {
+    my $id = shift;
+    die "Usage: project delete <id|identifier>\n" unless defined $id && $id ne '';
+    req('DELETE', '/api/v3/projects/' . $id);
+    say "Deleted project: $id";
+}
+
+# ── wp commands ────────────────────────────────────────────────────────────
+
+sub wp_list {
+    my $pid     = shift;
+    my $filters = shift;
+    die "No project — set OPENPROJECT_PROJECT_ID or use --project\n"
+        unless $pid;
+
+    my $base = '/api/v3/workspaces/' . $pid . '/work_packages';
+    if (@$filters) {
+        my $f = uri_esc(encode_json($filters));
+        $base .= '?filters=' . $f;
+    }
+    my $items = all_get($base);
+    table_wps($items);
+}
+
+sub wp_get {
+    my $id = shift;
+    die "Usage: wp get <id>\n" unless defined $id && $id ne '';
+    json_out(req('GET', '/api/v3/work_packages/' . $id));
+}
+
+sub wp_create {
+    my $pid     = shift;
+    my $subject = shift;
+    my $opt     = shift;
+    my %b = (subject => $subject);
+    if ($opt->{description}) {
+        $b{description} = { format => 'markdown', raw => $opt->{description} };
+    }
+    my %sl;
+    if ($opt->{type}) {
+        my $t = rid($opt->{type}, '/api/v3/types');
+        $sl{type} = { href => '/api/v3/types/' . $t } if $t;
+    }
+    if ($opt->{status}) {
+        my $s = rid($opt->{status}, '/api/v3/statuses');
+        $sl{status} = { href => '/api/v3/statuses/' . $s } if $s;
+    }
+    if ($opt->{priority}) {
+        my $p = rid($opt->{priority}, '/api/v3/priorities');
+        $sl{priority} = { href => '/api/v3/priorities/' . $p } if $p;
+    }
+    if ($opt->{parent}) {
+        my $p = rid($opt->{parent}, '/api/v3/work_packages');
+        $sl{parent} = { href => '/api/v3/work_packages/' . $p } if $p;
+    }
+    $b{_links} = {%sl} if %sl;
+    my $r = req('POST', '/api/v3/workspaces/' . $pid . '/work_packages', \%b);
+    say "Created ticket: #" . $r->{id} . "  " . $r->{subject};
+}
+
+sub wp_update {
+    my $id   = shift;
+    my $upd  = shift;
+    my $cur  = req('GET', '/api/v3/work_packages/' . $id);
+    my $lock = $cur->{lockVersion} // 0;
+    my %b = (lockVersion => $lock);
+    $b{subject}        = $upd->{subject}      if $upd->{subject};
+    if ($upd->{description}) {
+        $b{description} = { format => 'markdown', raw => $upd->{description} };
+    }
+    $b{percentageDone} = int($upd->{percentdone}) if defined $upd->{percentdone};
+    my %sl;
+    if ($upd->{type}) {
+        my $t = rid($upd->{type}, '/api/v3/types');
+        $sl{type} = { href => '/api/v3/types/' . $t } if $t;
+    }
+    if ($upd->{status}) {
+        my $s = rid($upd->{status}, '/api/v3/statuses');
+        $sl{status} = { href => '/api/v3/statuses/' . $s } if $s;
+    }
+    if ($upd->{priority}) {
+        my $p = rid($upd->{priority}, '/api/v3/priorities');
+        $sl{priority} = { href => '/api/v3/priorities/' . $p } if $p;
+    }
+    $b{_links} = {%sl} if %sl;
+    req('PATCH', '/api/v3/work_packages/' . $id, {%b});
+    say "Updated ticket: #$id";
+}
+
+sub wp_delete {
+    my $id = shift;
+    die "Usage: wp delete <id>\n" unless defined $id && $id ne '';
+    req('DELETE', '/api/v3/work_packages/' . $id);
+    say "Deleted ticket: #$id";
+}
+
+sub wp_link {
+    my ($id, $opt) = @_;
+    die "Usage: wp link <id> --precedes <id>|--follows <id>\n"
+        unless defined $id && $id ne '';
+    my ($rel, $other) = ($opt->{precedes} ne '' ? ('precedes', $opt->{precedes})
+                    : $opt->{follows}    ne '' ? ('follows',    $opt->{follows})
+                    : (undef, undef));
+    die "Usage: wp link <id> --precedes <id>|--follows <id>\n" unless $rel;
+    req('POST', '/api/v3/work_packages/' . $id . '/relations', {
+        type   => $rel,
+        _links => { to => { href => '/api/v3/work_packages/' . $other } },
+    });
+    my $verb = $rel eq 'precedes' ? 'must finish before' : 'starts after';
+    say "Linked: #$id $verb #$other";
+}
+
+# ── board commands ────────────────────────────────────────────────────────
+
+sub split_simple_flags {
+    my ($allowed, @raw) = @_;
+    my (%flags, @pos);
+    for (my $i = 0; $i <= $#raw; $i++) {
+        my $a = $raw[$i];
+        if ($a =~ /^--([a-z]+)=(.*)$/ && exists $allowed->{$1}) { $flags{$1} = $2; }
+        elsif ($a =~ /^--([a-z]+)$/ && exists $allowed->{$1})   { $i++; $flags{$1} = $raw[$i] // ''; }
+        else { push @pos, $a; }
+    }
+    return (\%flags, \@pos);
+}
+
+sub resolve_pid {
+    my ($pid) = @_;
+    return ($pid, $pid) if $pid =~ /^\d+$/;
+    my $p = req('GET', '/api/v3/projects/' . uri_esc($pid));
+    return ($p->{id}, $p->{identifier});
+}
+
+sub project_boards {
+    my ($ident) = @_;
+    my $grids = all_get('/api/v3/grids');
+    my @bs = grep {
+        my $s = $_->{_links}{scope}{href} // '';
+        $s =~ m{^/projects/\Q$ident\E/boards(?:/|$)}
+    } @$grids;
+    return \@bs;
+}
+
+sub board_list {
+    my ($ident) = @_;
+    my $bs = project_boards($ident);
+    my $n = scalar @$bs;
+    if ($n == 0) {
+        say "\nNo boards in project '$ident'.\n";
+        return;
+    }
+    printf "\nBoards in %-20s (%d)\n\n", $ident, $n;
+    printf "  %-5s %-24s %-12s %s\n", 'ID', 'Name', 'Type', 'Scope';
+    print '  ' . '-' x 80, "\n";
+    for my $b (@$bs) {
+        my $opt  = $b->{options} // {};
+        my $type = $opt->{type} // 'free';
+        $type .= '/' . $opt->{attribute} if $opt->{attribute};
+        my $scope = $b->{_links}{scope}{href} // '';
+        printf "  %-5s %-24s %-12s %s\n", $b->{id}, $b->{name} // '?', $type, $scope;
+    }
+    say "";
+}
+
+sub board_summary {
+    my ($pid, $ident, $ref) = @_;
+    my $grid;
+    if (defined $ref && $ref =~ /^\d+$/) {
+        $grid = req('GET', '/api/v3/grids/' . $ref);
+        my $s = $grid->{_links}{scope}{href} // '';
+        die "Grid $ref is not a board (scope: $s)\n" unless $s =~ m{/boards(?:/|$)};
+    } else {
+        my $bs = project_boards($ident);
+        die "No boards found in project '$ident'.\n" unless @$bs;
+        if (defined $ref) {
+            ($grid) = grep { lc($_->{name}) eq lc($ref) } @$bs;
+            die "Board '$ref' not found.\n" unless $grid;
+        } else {
+            $grid = $bs->[0];
+        }
+    }
+
+    my $bname = $grid->{name} // 'Board';
+    my $scope = $grid->{_links}{scope}{href} // "/projects/$ident/boards";
+    $scope =~ s{/$}{};
+    $scope .= '/' . $grid->{id} if $scope !~ m{/$grid->{id}$};
+
+    # column order comes from the board widgets
+    my @widgets = sort { ($a->{startColumn} // 0) <=> ($b->{startColumn} // 0) }
+                  @{$grid->{widgets} // []};
+    my @cols;
+    for my $w (@widgets) {
+        my $opts = $w->{options} // {};
+        my @sids;
+        for my $f (@{$opts->{filters} // []}) {
+            my $sf = $f->{status};
+            push @sids, @{$sf->{values} // []} if $sf;
+        }
+        my $qid   = $opts->{queryId} // $opts->{query_id};
+        my $qname = '';
+        if ($qid) {
+            eval { $qname = req('GET', "/api/v3/queries/$qid")->{name} // ''; };
+        }
+        push @cols, { sids => \@sids, name => ($qname ne '' ? $qname : "Column $w->{startColumn}") };
+    }
+
+    # open + closed work packages for this project (one API call each)
+    my $open_f = uri_esc(encode_json([
+        { project => { operator => '=', values => [$pid] } },
+        { status  => { operator => 'o' } },
+    ]));
+    my $closed_f = uri_esc(encode_json([
+        { project => { operator => '=', values => [$pid] } },
+        { status  => { operator => 'c' } },
+    ]));
+    my $open   = all_get("/api/v3/work_packages?filters=$open_f");
+    my $closed = all_get("/api/v3/work_packages?filters=$closed_f");
+
+    my (%col_count, %off_board, %by_type, @hot);
+    my %PRIO = (Immediate => 3, High => 2, Normal => 1, Low => 0);
+    for my $w (@$open) {
+        my $href = $w->{_links}{status}{href} // '';
+        my ($sid) = $href =~ m{/(\d+)$};
+        $sid //= '';
+        my $stitle = $w->{_links}{status}{title} // '?';
+        my $ttitle = $w->{_links}{type}{title}   // '?';
+        my $ptitle = $w->{_links}{priority}{title} // '';
+        $by_type{$ttitle}++;
+        if ($ptitle eq 'High' || $ptitle eq 'Immediate') {
+            push @hot, [$w->{id}, $ptitle, $w->{subject} // '', $stitle];
+        }
+        my $in_col = 0;
+        for my $c (@cols) {
+            if (grep { $_ eq $sid } @{$c->{sids}}) {
+                $col_count{$sid}++;
+                $in_col = 1;
+                last;
+            }
+        }
+        $off_board{$stitle}++ unless $in_col;
+    }
+
+    my $open_n   = scalar @$open;
+    my $closed_n = scalar @$closed;
+    my $total_n  = $open_n + $closed_n;
+
+    say "";
+    say "  Board:   $bname  (grid $grid->{id})";
+    say "  URL:     $OP_URL$scope";
+    say "  Project: $ident";
+    say "";
+
+    if (@cols == 0) {
+        say "  Board has no columns yet.\n";
+        return;
+    }
+
+    my $maxcount = 1;
+    for my $c (@cols) {
+        my $cc = 0;
+        for my $sid (@{$c->{sids}}) { $cc += $col_count{$sid} // 0; }
+        $c->{count} = $cc;
+        $maxcount = $cc if $cc > $maxcount;
+    }
+
+    my $barlen = 16;
+    say '  ' . 'Columns';
+    for my $c (@cols) {
+        my $cc  = $c->{count};
+        my $bar = $cc > 0 ? "\x{2588}" x int($cc / $maxcount * $barlen + 0.5) : '';
+        $bar = "\x{258F}" if $cc > 0 && $bar eq '';
+        printf "    %-16s %4d  %s\n", $c->{name}, $cc, $bar;
+    }
+    print '    ' . '-' x 38, "\n";
+    my $off_n = 0;
+    $off_n += $_ for values %off_board;
+    printf "    Open %d · Closed %d · Total %d%s\n",
+        $open_n, $closed_n, $total_n,
+        ($off_n > 0 ? sprintf("  (plus %d in off-board statuses)", $off_n) : '');
+
+    if (%by_type) {
+        say "";
+        say "  Open by type";
+        say '    ' . join('  ·  ', map { "$_ $by_type{$_}" } sort { $by_type{$b} <=> $by_type{$a} } keys %by_type);
+    }
+
+    if (@hot) {
+        @hot = sort { ($PRIO{$b->[1]} // 0) <=> ($PRIO{$a->[1]} // 0) || $a->[0] <=> $b->[0] } @hot;
+        say "";
+        say "  High priority / blockers (open)";
+        my $n = @hot > 8 ? 8 : @hot;
+        for my $i (0 .. $n - 1) {
+            my $h = $hot[$i];
+            my $sub = $h->[2];
+            $sub = substr($sub, 0, 44) . '…' if length($sub) > 45;
+            printf "    #%-5s [%-9s] %-46s %s\n", $h->[0], $h->[1], $sub, $h->[3];
+        }
+    }
+    say "";
+}
+
+# ── usage ──────────────────────────────────────────────────────────────────
+
+sub usage {
+    say <<'END';
+
+  op — OpenProject CLI
+
+  Commands:
+
+    project list                              list all projects
+    project get <id|slug>                     show project (JSON)
+    project create <name> [slug]              create a project
+    project update <id|slug> key=val ...      change project fields
+    project delete <id|slug>                  remove a project
+
+    wp list [--project P] [--status S] [--type T] [--priority P]
+                                                  list / filter tickets
+    wp get <id>                               show ticket (JSON)
+    wp create <subject> [--type T] [--status S] [--priority P] [--parent P]
+                        [--description D]
+    wp update <id> key=val ...                change ticket fields
+    wp delete <id>                            remove a ticket
+    wp link <id> --precedes <id>              finish-to-start: <id> must finish
+    wp link <id> --follows <id>               (precedes) / start after (follows)
+
+    wp types                                  show available types
+    wp statuses                               show available statuses
+    wp priorities                             show available priorities
+
+    board list                                list boards in the project
+    board summary [id|name] [--project P]     Kanban overview: columns,
+                                              counts, open/closed, types,
+                                              high-priority items
+
+    config                                    show .env settings
+    help                                      this screen
+
+  Note: OPENPROJECT_PROJECT_ID in .env sets the default project.
+        Override with --project anywhere.
+
+END
+}
+
+sub show_config {
+    say "\n  config:  ";
+    printf "    OPENPROJECT_URL       %s\n",   $OP_URL;
+    printf "    OPENPROJECT_TOKEN     %s\n",   $OP_TOKEN ? '(set)'  : '(missing)';
+    printf "    OPENPROJECT_USER      %s\n",   $OP_USER;
+    printf "    OPENPROJECT_PROJECT   %s\n\n", $OP_PID || '(none)';
+}
+
+# ── main dispatch ──────────────────────────────────────────────────────────
+
+if (@ARGV == 0 || $ARGV[0] eq 'help' || $ARGV[0] eq '--help' || $ARGV[0] eq '-h') {
+    usage();
+    exit 0;
+}
+
+my $cmd = shift @ARGV;
+
+# ── config ─────────────────────────────────────────────────────────────────
+
+if ($cmd eq 'config') {
+    show_config();
+    exit 0;
+}
+
+# ── project ────────────────────────────────────────────────────────────────
+
+if ($cmd eq 'project') {
+    my $sub = shift @ARGV // 'list';
+    if ($sub eq 'list') {
+        prj_list();
+    } elsif ($sub eq 'get') {
+        prj_get(shift @ARGV);
+    } elsif ($sub eq 'create') {
+        prj_create(shift @ARGV, shift @ARGV);
+    } elsif ($sub eq 'update') {
+        my $pid2 = shift @ARGV;
+        prj_update($pid2, kv(@ARGV));
+    } elsif ($sub eq 'delete') {
+        prj_delete(shift @ARGV);
+    } else {
+        die "Unknown project subcommand: $sub\nRun: tools/op help\n";
+    }
+    exit 0;
+}
+
+# ── wp ─────────────────────────────────────────────────────────────────────
+
+if ($cmd eq 'wp') {
+    my %flags;
+    my @pos;
+    # Two-pass: split --flags from positional
+    my @raw = @ARGV;
+    @ARGV = ();
+    for my $i (0 .. $#raw) {
+        my $a = $raw[$i];
+        if ($a =~ /^--(project|status|type|priority|description|parent|precedes|follows)=(.+)$/) {
+            $flags{$1} = $2;
+        } elsif ($a =~ /^--(project|status|type|priority|description|parent|precedes|follows)$/) {
+            $i++;
+            $flags{$1} = ($i <= $#raw ? $raw[$i] : '');
+        } else {
+            push @pos, $a;
+        }
+    }
+
+    my $sub = $pos[0] // 'list';
+    my $pid = $flags{project} // $OP_PID;
+
+    # Build filter array for wp list
+    my @f;
+    my %ENDPOINT = (status => 'statuses', type => 'types', priority => 'priorities');
+    if ($sub eq 'list') {
+        for my $k (keys %ENDPOINT) {
+            if ($flags{$k}) {
+                my $eid = rid($flags{$k}, '/api/v3/' . $ENDPOINT{$k});
+                if ($eid) {
+                    push @f, { $k => { operator => '=', values => [$eid] } };
+                }
+            }
+        }
+    }
+
+    if ($sub eq 'list') {
+        wp_list($pid, \@f);
+    } elsif ($sub eq 'get') {
+        wp_get($pos[1]);
+    } elsif ($sub eq 'types') {
+        table_enum('Available Types', all_get('/api/v3/types'));
+    } elsif ($sub eq 'statuses') {
+        table_enum('Available Statuses', all_get('/api/v3/statuses'));
+    } elsif ($sub eq 'priorities') {
+        table_enum('Available Priorities', all_get('/api/v3/priorities'));
+    } elsif ($sub eq 'create') {
+        wp_create($pid, $pos[1], {%flags});
+    } elsif ($sub eq 'update') {
+        my @tail = @pos[2 .. $#pos];
+        wp_update($pos[1], kv(@tail));
+    } elsif ($sub eq 'delete') {
+        wp_delete($pos[1]);
+    } elsif ($sub eq 'link') {
+        wp_link($pos[1], {%flags});
+    } else {
+        die "Unknown wp subcommand: $sub\nRun: tools/op help\n";
+    }
+    exit 0;
+}
+
+# ── board ──────────────────────────────────────────────────────────────────
+
+if ($cmd eq 'board') {
+    my ($fl, $pos) = split_simple_flags({ project => 1 }, @ARGV);
+    my $sub = $pos->[0] // 'list';
+    my $pid_ref = $fl->{project} // $OP_PID;
+    die "No project — set OPENPROJECT_PROJECT_ID or use --project\n"
+        unless $pid_ref;
+    my ($bpid, $bident) = resolve_pid($pid_ref);
+    if ($sub eq 'list') {
+        board_list($bident);
+    } elsif ($sub eq 'summary') {
+        board_summary($bpid, $bident, $pos->[1]);
+    } else {
+        die "Unknown board subcommand: $sub\nRun: op help\n";
+    }
+    exit 0;
+}
+
+die "Unknown command: $cmd\nRun: tools/op help\n";

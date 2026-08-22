@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# dc — host + Docker hygiene checks for the WebAX meta-project.
+#
+#   dc ports              # listening TCP ports on the host
+#   dc port <PORT>        # is a specific port in use?
+#   dc images             # images (dangling flagged) + reclaimable summary
+#   dc containers         # containers (stopped/created flagged)
+#   dc check <name>       # is a name used by a container/image/network/volume?
+#   dc cleanup            # disk usage + what would be reclaimed (dry-run report)
+set -u
+
+list_ports() {
+  ss -tln 2>/dev/null | awk 'NR>1 { split($4,a,":"); print a[length(a)] }' | sort -un
+}
+
+cmd="${1:-help}"
+case "$cmd" in
+  ports)
+    echo "Listening TCP ports (host):"
+    ss -tln 2>/dev/null | awk 'NR>1 { split($4,a,":"); printf "  %-8s %s\n", a[length(a)], $1 }' | sort -un | uniq
+    ;;
+  port)
+    p="${2:-}"; [ -n "$p" ] || { echo "usage: dc port <PORT>"; exit 1; }
+    if list_ports | grep -qx "$p"; then echo "PORT $p: IN USE"; exit 1; else echo "PORT $p: free"; fi
+    ;;
+  images)
+    echo "Docker images:"
+    docker images --format '  {{.Repository}}:{{.Tag}}  {{.Size}}  {{.ID}}'
+    echo ""
+    echo "Dangling (reclaimable) images:"
+    docker images -f dangling=true --format '  {{.ID}}  {{.Size}}  ({{.CreatedSince}})'
+    ;;
+  containers)
+    echo "Docker containers (stopped/created flagged):"
+    docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}' \
+      | awk -F'\t' '{ f=($3 ~ /Exited|Created/) ? "  <-- stopped" : ""; print "  "$1"  ["$2"]  "$3 f }'
+    ;;
+  check)
+    name="${2:-}"; [ -n "$name" ] || { echo "usage: dc check <name>"; exit 1; }
+    found=0
+    docker ps -a --format '{{.Names}}' | grep -qx "$name" && { echo "container '$name': IN USE"; found=1; }
+    docker images --format '{{.Repository}}:{{.Tag}}' | grep -Eq "(^|/)${name}(:|$)" && { echo "image '$name': IN USE"; found=1; }
+    docker network ls --format '{{.Name}}' | grep -qx "$name" && { echo "network '$name': IN USE"; found=1; }
+    docker volume ls --format '{{.Name}}' | grep -qx "$name" && { echo "volume '$name': IN USE"; found=1; }
+    [ "$found" = 0 ] && echo "'$name': free (no container/image/network/volume collision)"
+    exit "$found"
+    ;;
+  cleanup)
+    echo "Docker disk usage:"
+    docker system df
+    echo ""
+    echo "Reclaimable now:"
+    echo "  dangling images:     $(docker images -f dangling=true -q | wc -l)"
+    echo "  stopped containers:  $(docker ps -a -f status=exited -q | wc -l)"
+    echo "  unused networks:     $(docker network ls --filter dangling=true -q | wc -l)"
+    echo ""
+    echo "To reclaim (after confirming nothing is needed):"
+    echo "  docker image prune -f        # dangling images"
+    echo "  docker container prune -f    # stopped containers"
+    echo "  docker network prune -f      # unused networks"
+    ;;
+  *)
+    echo "usage: dc {ports|port <P>|images|containers|check <name>|cleanup}"
+    exit 1
+    ;;
+esac
